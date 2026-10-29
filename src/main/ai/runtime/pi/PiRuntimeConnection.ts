@@ -69,6 +69,7 @@ import { PiForkCheckpointSchema } from './forkCheckpoint'
 import { createPiGatewayModelBinding } from './gatewayModelBinding'
 import { createPiIdentityExtension } from './identityExtension'
 import { legacyDisabledToolId, assertLegacyDisabledToolsResolved } from './legacyToolPolicy'
+import { createPiMemoryTools } from './memoryTools'
 import { createPiBehaviorHost } from './piBehaviorHost'
 import { PiChildTasks } from './PiChildTasks'
 import {
@@ -101,6 +102,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
   private readonly eventQueue = new AsyncEventQueue<AgentRuntimeEvent>()
   readonly events = this.eventQueue
   private runtime?: PiRuntime
+  private memoryTools?: ReturnType<typeof createPiMemoryTools>
   private handle?: PiThreadHandle
   private observation?: Observation
   private context?: ReturnType<typeof preparePiBranch>
@@ -200,7 +202,11 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
         application.get('AgentSessionRuntimeService').getInteractionState(this.input.sessionId),
       getPermissionMode: () => this.permissionMode,
       isDisabled: (toolName: string) => this.isToolDisabled(toolName),
-      additionalReadOnlyRoots: [...additionalSkillPaths, application.getPath('feature.agents.outputs')],
+      additionalReadOnlyRoots: [
+        ...additionalSkillPaths,
+        application.getPath('feature.agents.outputs'),
+        application.getPath('feature.memory.data')
+      ],
       // Approval follows the mounted server set; disabledTools still blocks at fire-time.
       autoApprovedTools: new Set(
         mountedPolicies
@@ -223,6 +229,8 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
           .map(({ serverName, toolName }) => buildPiMcpToolName(serverName, toolName))
       )
     }
+    const memoryTools = createPiMemoryTools(pi, approvalContext)
+    this.memoryTools = memoryTools
     const mcpServers = buildAgentMcpServers(
       session,
       agent,
@@ -336,7 +344,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
       contextFiles: true,
       skillPaths: additionalSkillPaths,
       builtinTools: ['read', 'bash', 'edit', 'write', ...(process.platform === 'win32' ? ['powershell'] : [])],
-      tools: managedShellTools,
+      tools: [...managedShellTools, ...memoryTools.tools],
       excludeTools: [...this.disabledTools],
       behavior,
       settings: {
@@ -344,6 +352,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
         ...(loginPathPrefix ? { shellCommandPrefix: loginPathPrefix } : {})
       },
       extensionFactories: [
+        memoryTools.extension,
         createPiIdentityExtension(agentDataPath, this.input.sessionId),
         pi.createCodemodeExtension({ models: false }),
         pi.createToolSearchExtension(),
@@ -758,6 +767,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
 
   private finishTurn(): void {
     if (!this.sending || this.closing) return
+    this.memoryTools?.dispose()
     this.cancelQueuedInputs()
     this.flushInputs()
     this.sending = false
@@ -879,6 +889,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
 
   close(): Promise<void> {
     this.closing = true
+    this.memoryTools?.dispose()
     this.closingAccess.abort()
     return (this.closePromise ??= this.finishClose().catch((error) => {
       this.closePromise = undefined
