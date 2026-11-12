@@ -27,6 +27,7 @@ import {
   applyNativeSubmissionResult
 } from '@main/ai/agentSession/nativeSubmission'
 import { ThreadProjection } from '@main/ai/agentSession/ThreadProjection'
+import { openRuntimeMemoryGuard } from '@main/ai/memory/memoryRuntime'
 import { buildAgentMcpServers, warmAgentMcpToolCatalogs } from '@main/ai/runtime/agentMcpServers'
 import { buildAgentRuntimePrompt } from '@main/ai/runtime/agentPrompt'
 import { prepareAgentSessionWorkspaceDirectory } from '@main/ai/runtime/agentSessionWorkspace'
@@ -126,6 +127,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
   >()
   private failure?: unknown
   private connectionSignature?: string
+  private memoryGuard?: ReturnType<typeof openRuntimeMemoryGuard>
   private permissionMode: AgentPermissionMode = 'default'
   private disabledTools = new Set<string>()
   private reconcileChain: Promise<unknown> = Promise.resolve()
@@ -141,6 +143,15 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
 
   async start(): Promise<this> {
     await application.get('MemoryMigrationService').ensureSession(this.input.sessionId)
+    this.memoryGuard = openRuntimeMemoryGuard(this.input.sessionId, () => {
+      void this.close().catch((error) => logger.error('Failed to stop invalidated memory runtime', { error }))
+    })
+    try {
+      await this.memoryGuard.check()
+    } catch (error) {
+      this.memoryGuard.dispose()
+      throw error
+    }
     const discovery = await capturePiConnectionSnapshot(
       this.input.sessionId,
       this.input.agentId,
@@ -435,11 +446,13 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
   }
 
   private async submit(input: AgentRuntimeCommand, text: string, whenBusy: 'reject' | 'steer'): Promise<void> {
+    await this.memoryGuard?.check()
     const draft = prepareNativeSubmission(this.input.sessionId, input.message.id, this.context!.id, whenBusy, {
       text,
       parts: input.message.data.parts
     })
     this.input.onInputPrepared?.(input.message.id, this.context!.id)
+    await this.memoryGuard?.check()
     const result = await this.handle!.input.submit(draft)
     this.eventQueue.push({ type: 'input-submission', contextId: this.context!.id, result })
     if (result.status !== 'acknowledged') applyNativeSubmissionResult(this.input.sessionId, this.context!.id, result)
@@ -673,6 +686,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
     })
     const draft = prepareNativeSubmission(sessionId, messageId, contextId, 'steer')
     await projection.refresh()
+    await this.memoryGuard?.check()
     const result = await handle.input.submit(draft)
     applyNativeSubmissionResult(sessionId, contextId, result)
     await projection.refresh()
@@ -890,6 +904,7 @@ export class PiRuntimeConnection implements AgentRuntimeConnection {
   }
 
   close(): Promise<void> {
+    this.memoryGuard?.dispose()
     this.closing = true
     this.memoryTools?.dispose()
     this.closingAccess.abort()
