@@ -1,102 +1,197 @@
 ---
-description: Shared and private managed file memory, legacy migration, Knowledge Base, and independent graph memory
+description: Current shared/private memory behavior, conversation extraction and recall, Dreaming, recovery, and legacy-file boundaries
 sources:
   - src/main/ai/agents/prompt.ts
   - src/main/ai/memory
+  - src/main/ai/mcp/servers/cherryAutonomyTools.ts
   - src/main/ai/mcp/servers/memory.ts
+  - src/main/ai/runtime/aiSdk/params/buildAgentParams.ts
+  - src/main/ai/runtime/claudeCode
+  - src/main/ai/runtime/pi
   - src/main/features/knowledge
+  - src/main/ipc/handlers/agent.ts
+  - src/main/ipc/handlers/memory.ts
+  - src/renderer/components/memory
+  - src/renderer/components/resourceCatalog/dialogs/edit
+  - src/renderer/components/settingsMenu.ts
+  - src/renderer/pages/settings/MemorySettings.tsx
 ---
 
 # Memory Feature Overview
 
-Cherry Studio provides three distinct memory mechanisms. They differ in who they serve, how they persist, and where they are stored. Use this reference to pick the right one for your use case and to understand why enabling one does not affect the others.
+This reference describes the current implementation. See the [shared-memory Spec](../../../../.agents/notes/proposed/feature/2026-10-29-shared-memory.md) for the target design.
 
 ## Comparison
 
-| Memory Type | Applies To | Persistence | Storage Location | Cross-Session | Cross-Agent |
-|---|---|---|---|---|---|
-| Managed File Memory | Agent + opted-in persistent Assistant | Controlled Markdown read/write (`MEMORY.md` / `.memories/*.md`) | Shared `{userData}/Data/Memory/`; private `{agentData}/` | Yes | Shared preferences only; private knowledge stays with its Agent |
-| Knowledge Base | Assistant + Agent | Indexed retrieval (ingestion + vector/query) | Knowledge base directory | Yes | Yes |
-| MCP Memory | Agent | MCP protocol (`@cherry/memory` built-in server) | MCP server (`memory.json` knowledge graph) | Yes | Depends on server impl |
+| Mechanism | Content and storage | Scope | How it reaches the model |
+|---|---|---|---|
+| Managed file memory | `MEMORY.md` and `.memories/*.md` | Shared personal context; separate private knowledge for each Agent | Entry snapshot in the prompt; supported tools read topics |
+| Conversation recall | Existing chat messages and FTS5 indexes | The same Assistant or Agent, on selected conversation branches | The model calls `memory_search` |
+| Knowledge Base | Imported documents and retrieval indexes | Selected knowledge bases | Knowledge lookup tools |
+| Graph memory MCP | Entities, relations and observations in `memory.json` | Defined by the independent `@cherry/memory` server | MCP tool calls |
 
-## About "Global Memory"
+## Managed files and access
 
-Cherry Studio v1.x had **Global Memory**: a Settings toggle (`feature.memory.enabled`) that extracted durable facts from assistant chats. It was removed in v2 ([#14250](https://github.com/CherryHQ/cherry-studio/issues/14250)). Managed shared memory is a separate feature. Enabling access does not authorize reading or extracting all chat history.
+Shared files live under `{userData}/Data/Memory/`. Private files live directly under the current Agent data directory. Both use the same layout:
 
-If you relied on Global Memory in v1:
+```text
+MEMORY.md
+.memories/
+  preferences.md
+  details.md
+```
 
-- Agents can use shared preferences and their own private knowledge. Shared access defaults on for desktop Agents; external channels cannot access shared memory.
-- Persistent Assistants can opt in to shared entry references. Temporary and auxiliary requests remain ineligible. Assistant and Claude Code memory editing requires a supported execution adapter.
+Topic names can vary. The entry contains complete common facts and selected topic links. A topic groups related details and conditions. The active set includes the entry and all topics, including unlinked ones.
 
-## Viewing and editing memory in the app
+Private memory follows the Agent across sessions and working directories. Project and customer knowledge belongs in this Agent-wide private scope.
 
-Open the **Memory** tab in the Agent configuration dialog to view the four files
-that belong to the current agent:
+| Caller | Shared memory | Private memory |
+|---|---|---|
+| Desktop Agent conversation | Enabled unless `configuration.shared_memory_enabled` is false | Its own Agent |
+| Persistent Assistant conversation | Requires `settings.enableSharedMemory === true` | None |
+| Temporary, auxiliary or headless Assistant request | None | None |
+| Channel or headless Agent execution | No shared grant | Only its existing Agent scope, where the runtime integrates memory |
+| Shared-memory settings | Main-window authority for shared management | No managed private-file editor |
 
-- `SOUL.md`, `USER.md`, and `memory/FACT.md` are rendered as Markdown; `memory/JOURNAL.jsonl` is shown as raw JSONL.
-- The three Markdown files can be edited in place with explicit **Save** and **Cancel**, independently of configuration autosave. Switching files, leaving the Memory tab, or closing the dialog asks for confirmation before discarding unsaved changes. `JOURNAL.jsonl` is append-only and read-only in the app. Saves are validated against the agent data root, written atomically, and limited to 1 MB of text.
-- **Open folder** reveals the agent data directory for external tools.
+Main derives identity and scope from the live conversation and stored entity configuration. Disabling access invalidates existing grants and pending work. Re-enabling access requires fresh grants.
 
-This is a read/write view over the three editable Markdown files the runtime loads —
-there is still no app-wide Global Memory setting.
+Pi and Claude Code have explicit entry-loading and runtime-guard integrations. Pi also supports controlled native file writes.
 
-## Details
+## Settings and the existing Agent memory tab
 
-### Managed File Memory
+Open **Settings → Tools → Shared memory**, alongside MCP and Skills.
 
-With shared memory enabled for the current entity, Assistants, Pi, and Claude Code expose `memory_search` for model-selected historical recall through the existing chat FTS5 indexes. Prompt hooks do not search automatically. Recall stays within the same Assistant or Agent and selected conversation branches. It excludes deleted conversations, failed messages, channels, background/child sessions, and cross-session deliveries. It does not save the retrieved text as memory or create another index.
+- **Generate memory in chats** and **Automatically organize memory** are independent global switches, both enabled by default. They use the configured default model and can consume its quota.
+- Disabling generation stops automatic conversation extraction and invalidates its pending output. Existing-file organization remains available.
+- Disabling automatic organization leaves generation and **Organize now** available.
+- The page shows the last completed, failed or cancelled result. **Restore backup** and **Clear global memory** require confirmation.
+- Agent and Assistant **Basic** forms label their access switch **Shared memory**. The Agent switch precedes Heartbeat and defaults on; the Assistant switch defaults off. Presets carry this switch setting.
 
-The current user question is excluded by message ID from search hits, surrounding context, and explicit message expansion. Earlier messages in the same conversation and identical questions in other conversations remain searchable.
+The Agent configuration dialog also has a **Memory** tab for identity and legacy files. It displays `SOUL.md`, `USER.md`, `memory/FACT.md` and `memory/JOURNAL.jsonl` through `agent.memory.*` IPC.
 
-The model supplies focused keywords of at most 512 characters, or a returned conversationId/messageId pair to expand another message. Trigram MATCH/BM25 ranks up to 64 candidates; queries containing only short terms use escaped LIKE. Recall keeps the first six eligible matches and expands only the top match with up to five messages on each side and the first and last three messages of its selected branch. Context counts successful, nonempty user and assistant messages. It follows branch order, removes duplicate message IDs across context and matches, and returns at most 22 excerpts. Branch traversal reads identifiers and eligibility through the full parent chain so long conversations retain their actual beginning; only selected excerpts load bodies. Excerpts carry message IDs, conversation IDs, roles, dates, and truncation flags; search matches also carry their rank. Assistant replies are labeled as generated content, not user-confirmed facts. This is keyword recall, not exhaustive semantic retrieval. Existing runtime isolation checks block recall when memory contains forgotten or expired state. Recall is returned as a tool result. Entry snapshots are cached per product conversation and scope until application restart; ordinary memory writes appear in new conversations. Every reuse still checks authorization and runtime isolation.
+Its three Markdown files have explicit Save/Cancel, version-conflict checks, and a 1 MiB read/write limit. Truncated files and JOURNAL are read-only. Leaving an unsaved draft requires confirmation. These operations use the legacy editor's own protection.
 
-- Each answer allows at most four `memory_search` calls, shared by keyword search and message expansion. Assistants remove the tool after the budget is used; Agent calls then return a stop-searching message. The next answer starts a new budget.
-- `MEMORY.md` contains complete common facts and selected topic links. `.memories/*.md` contains related details. Each conversation loads eligible entry snapshots once; topics require a full controlled read before editing.
-- Settings → Tools → Shared Memory appears alongside MCP and Skills and shows generation and automatic organization as independent options with the same information tooltips as Default Models → Quick Model. It has no file section, content preview, or Agent private-memory entry. Restore backup and Clear global memory each have their own settings row, with Restore and a red Clear button on the right. Both require confirmation. Clear hides filenames while its backend token binds the exact files and versions; recovery retains its preview. Recovery shows Saved and clearing shows Cleared successfully, each beside its corresponding action button on the same row. Feedback comes only from actual commit results; recoverable backups remain after clearing.
-- Agent and Assistant forms retain Shared memory in their existing configuration, defaulting on and off respectively. Both use the basic-field layout and compact switch; the Agent row precedes the heartbeat section. Presets carry the switch without memory bodies.
-- Entries allow 200 lines and 25,000 UTF-8 bytes; topics allow 25,000 bytes. Oversized external originals are preserved. These limits are save protections, not additional configuration fields.
-- Pi native reads, writes, and edits bind caller-specific read receipts to exact approved proposals. Backups precede writes, and actual results are checked. Unsupported Claude native operations and identity-free filesystem MCP access to managed memory are rejected. Shell and external tools remain outside this cooperative protection.
-- Each scope retains up to five recovery batches within 20 MiB. Protected batches are retained; insufficient backup capacity rejects a write. Recovery protects later changes and reports conflicts or partial results.
-- `SOUL.md` and `USER.md` remain separate identity files. Their contents are not copied into shared memory.
+After successful migration, FACT becomes retained history; later edits in this tab affect only that legacy file. `SOUL.md` and `USER.md` retain their separate identity roles.
 
-Legacy FACT migration preserves complete Markdown sections and original bytes, then checks every new private file before activation. Oversized indivisible sections or conflicts leave migration incomplete and retain readonly legacy facts. JOURNAL is unchanged and stops receiving events. Neither the old Agent Memory MCP nor ordinary file tools write these historical files. No dual-writing or alternating old/new app version compatibility is promised.
+## Entry snapshots in model requests
 
-### Organization (Dreaming)
+The first authorized request loads the eligible shared entry and, for an Agent, its private entry. `MemoryService.entrySnapshot()` caches them by product conversation and scope until application restart. Later turns, steps, reconnects and compaction reuse that snapshot. Ordinary memory writes appear automatically in a new conversation.
 
-The experimental `memory.dreaming.preview_extraction` main-window endpoint accepts an explicit recent conversation range and returns evidence-linked candidates. It follows parent links within one branch, compares shared entry and topic files, and checks source/file versions again before returning. The model cites message IDs, memory paths and exact quotes without receiving or generating version strings. The program binds versions from the input snapshots; reconciliation also omits versions from model input. Invalid references and changed sources still fail the preview. Extraction requests one independently useful fact per candidate, keeping its conditions intact and separating activities from goals. Multiple candidates from multiple batches receive one additional model reconciliation. The program pre-groups compatible subjects, scopes, kinds, actions, conditions and times for duplicate checks; conflicts are still checked across all candidates. Valid duplicates retain combined evidence. Invalid duplicate merges or merged-reference overflow retain the original validated candidates without discarding unrelated groups. Conflicting or uncertain additions remain insufficient for use. Reconciliation must cover every candidate exactly once; invalid structure, missing or repeated ids, conflict-reference overflow and over-budget output still fail the preview. Semantic classification still depends on the model. Project/customer candidates remain outside personal shared memory. It shares the existing execution lock but does not advance extraction cursors or write memories. There is no UI entry yet. This explicit preview has no save endpoint, historical backfill, or restart recovery. Both extraction paths select by concrete future use without requiring an explicit request to remember. Supported personal experiences, plans, decisions and constraints may qualify; project/customer ownership limits remain. The automatic path now uses the same context candidate engine and commits eligible additions through the existing memory store. See the module contract for budgets and validation limits.
+Pi replaces the `cherry_memory` system section before model requests. Claude Code supplies the reference through prompt-submit and session-start hooks. Persistent Assistant chat reuses it in `prepareStep` after compaction. Each path rechecks authorization and memory safety. An empty reference withdraws earlier memory guidance.
 
-"Generate memory in chats" and "Automatically organize memory" are independent global switches in existing preferences, both defaulting on. Turning off generation stops only conversation extraction and invalidates its pending output. Automatic and manual organization remain available. Turning off automatic organization still allows extraction and manual requests. Both features use the application default model; no separate selector is added. Extraction, candidate reconciliation and organization do not set a call-level output token cap. Preflight output estimates only reserve room when admitting inputs. Provider defaults, model capacity, response byte limits and evidence validation still apply.
+Entries are reference data. Current user instructions take precedence. Topic contents require a separate tool read. A truncated entry is marked incomplete; edits require a full read.
 
-Extraction receives new successful desktop conversation events, with Agent/Assistant shared-access permission checked again before reading and saving. It never scans historical chats or uses channels, background tasks, temporary requests, synthetic input, or cross-session deliveries. After restart, clearing, recovery, cancellation, or generation-switch changes, only newly written messages are eligible. Entity configuration changes also conservatively exclude older messages. Deleting or editing a source cancels uncommitted extraction; saved memories remain until explicitly removed or recovered.
+## Automatic conversation extraction
 
-Automatic extraction follows the successful turn's parent chain within the current authorization boundary. It reads up to 16 visible user/assistant messages and 32,000 UTF-8 bytes, with an 8,000-byte per-message limit. It starts at a user turn and marks clipped left context as incomplete. Assistant text supplies context only; evidence must cite user text. The queued fingerprint covers the whole selected range, so changes to earlier evidence invalidate pending output. Extraction compares the entry and all topics, capped at 40 files and 32,000 bytes, using the same overlapping batches and reconciliation as preview. Only validated personal `add` candidates append to the entry. Existing facts, conflicts, uncertain evidence and out-of-scope candidates remain separate outcomes. Job results report saved counts, candidate actions and batch reasons. Full entries fail without replacing old facts. Structured or forgotten scopes still stop automatic saving. Source references are checked during the task; persistent output remains plain memory text rather than a new provenance store. Commits bind all input receipts and the file set and retain backups and final authorization checks. The queue holds at most 32 references; durable admission cursors prevent replay without storing message bodies. Overflow and failures are not retried automatically. Extraction and organization share one physical worker lock. Model quality requires separate representative-model evaluation.
+`MemoryDreamingService` receives main-owned successful desktop completion events. It checks the source owner, successful persisted reply, message versions, and the entity's shared-access switch. It excludes channels, background/child work, temporary requests, synthetic input and cross-session deliveries. Assistant replies can provide context; only user text can support a saved fact.
 
-Settings show the last recorded completed, failed, or cancelled result and its time. This record is separate from the current task state, so disabling a switch or becoming idle cannot report a failed attempt as successful.
+For each admitted turn, the service follows parent links through recent messages on the same branch. The range starts at a user turn and contains at most 16 messages and 32,000 UTF-8 bytes, with at most 8,000 bytes per message. Missing left context is marked incomplete.
 
-One global queue runs only while conversations are idle. A batch includes at most ten complete memory files and 50,000 UTF-8 bytes, then reduces inputs further to fit the model's declared limits. It makes one model call with tools disabled. Unknown or insufficient model capacity pauses work. No chat history, JOURNAL, identity files, other scopes, or network retrieval is supplied.
+The extraction engine:
 
-Eligible changes are ten controlled content edits to a file, seven days since its first pending change, changed/unprocessed content reaching the size warning, or a manual request. Metadata, failed/no-op saves, organization, and recovery do not add controlled counts. External changes start a pending observation without inventing edit counts. Unchanged checked files do not trigger again merely because they are large.
+1. Reads the shared entry and topics, up to 40 files and 32,000 UTF-8 bytes in total.
+2. Splits conversation text into batches of at most 16,000 bytes, overlapping up to two complete messages.
+3. Requests at most eight candidates per batch. Each candidate carries one independently useful fact, its subject, conditions, time, intended future use, action, and exact user-text evidence.
+4. Verifies quoted text and references against the input snapshots, then binds message/file versions.
+5. When multiple batches produce multiple candidates, makes one additional model call to reconcile duplicates and conflicts across batches.
+6. Appends only validated personal `add` candidates through the managed store. Existing facts remain unchanged.
 
-Durable progress lives in module-owned `app_state`; JobManager history can be removed independently. Each unchanged input is included in the commit baseline. Failures allow at most two attempts per unchanged input with a ten-minute delay; a manual request or new input creates another opportunity. Cancellation, shutdown, clearing, recovery, and deleted owners fence uncommitted output. A foreground conversation interrupts active organization.
+Selection is based on concrete future value. Supported personal experiences, plans, decisions and constraints may qualify, including one-time events and temporary circumstances. Candidates preserve the original timing, conditions and certainty. Secrets, unsupported guesses and project/customer information are excluded from personal shared memory.
 
-Topic deletion is conservative: both source and destination must be distinct managed topics; `MEMORY.md` cannot serve as either. The prompt and proposal schema use the same path rule; all active files must have been supplied, source text must remain verbatim in a written topic destination, and remaining Markdown/wiki links must no longer target the source. HTML links require manual review. Destinations and link edits save before removal. Partial saves remain recoverable. This does not prove semantic equivalence of model rewrites.
+`exists`, `conflict`, `insufficient`, `omit` and `out_of_scope` are separate outcomes. Compatible fields narrow duplicate checks, and the model judges semantic equivalence. Conflicting additions are withheld and existing facts remain unchanged.
 
-The implementation remains a Draft stack. Focused lifecycle, migration, file-commit, settings, and cancellation regressions are covered. On 2026-10-30, real-model service integration checks passed 44/44 cases each for `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`, and `gpt-6-astra`, covering extraction, organization, recall, cancellation, and Agent isolation. The tests use production memory services and files with an HTTP adapter and fixture-driven completion/worker events. They do not establish complete desktop chat, real-time scheduling, large-volume, native-platform, or packaged-build acceptance. See [the module contract](../../../../src/main/ai/memory/README.md) for boundaries.
+Saved additions are ordinary Markdown list content. Evidence and source versions are used during validation. A full entry stops saving and preserves existing content.
 
-### Knowledge Base (Assistant + Agent)
+### Scheduling, cancellation and limits
 
-- User-curated document collections with per-base ingestion and retrieval indexes.
-- Both assistants and agents can query the base via the knowledge lookup tools; not automatic — the model must choose to retrieve.
-- See `docs/dev/references/knowledge/`.
+Extraction and organization share one physical mutex and the `memory.dreaming` worker. Maintenance yields to foreground conversations. The extraction queue keeps at most 32 source references in memory. Per-conversation `app_state` cursors record admission and outcome without message bodies. Admission advances the cursor; overflow and failures are not retried automatically.
 
-### MCP Memory (Agent)
+Restart, cancellation, clear, recovery and generation-switch changes establish new admission boundaries and discard pending work. Entity updates also exclude earlier messages. Source edits, deletion, owner changes or revocation invalidate uncommitted output. Topic/session renaming preserves pending work. Already-saved memory remains after source deletion.
 
-- The built-in `@cherry/memory` MCP server (`src/main/ai/mcp/servers/memory.ts`) exposes a `memory.json` knowledge-graph (entities / relations / observations).
-- Agents call it through MCP tools; persistence and sharing depend on the server implementation.
+Extraction and reconciliation use the default model with tools and automatic model-call retries disabled. Output tokens follow the model and provider limits. Preflight estimates reserve room for output; byte limits and schema validation also apply.
 
-## Choosing
+### Explicit range preview
 
-- Common preferences across eligible callers → **Shared File Memory**.
-- Long-running project knowledge for a single Agent → **Private File Memory**; persona remains in SOUL.md/USER.md.
-- Searchable reference material you curate → **Knowledge Base**.
-- Structured entity/relation memory driven by MCP → **MCP Memory**.
+The main-window-only `memory.dreaming.preview_extraction` endpoint uses the same candidate engine for a caller-selected recent range. It accepts up to 64 messages and 64,000 bytes, within the same admission and authorization boundaries. It checks source/file versions again before returning.
+
+This API-only preview returns candidates for the current call and leaves files and the automatic cursor unchanged. Interrupted previews require a new request. Automatic extraction uses the same engine with a guarded save path.
+
+## Historical conversation recall
+
+When `memory_search` is available, the prompt asks the model to search if past context is needed and the current conversation and entry snapshot are insufficient. The model chooses keywords or expands a returned message.
+
+Recall uses existing FTS5 indexes. It stays within the same Assistant's topics or the same Agent's desktop main conversations and their selected branches. It excludes deleted conversations, failed messages, channels, background/child sessions and cross-session deliveries.
+
+The currently answered user message is excluded by its message ID, derived from the reply's parent. This exclusion applies to search hits, surrounding context and explicit expansion. Earlier messages in the same conversation and identical historical questions remain eligible.
+
+| Limit | Current behavior |
+|---|---|
+| Calls per answer | Four, shared by search and message expansion |
+| Query | Focused keywords, up to 512 characters |
+| Ranking | Trigram MATCH/BM25; escaped LIKE when all terms are short |
+| Candidates and hits | Up to 64 candidates from successful user messages; first six eligible matches |
+| Automatic context | Only the first hit: up to five messages before/after it, plus first/last three messages of its branch |
+| Returned excerpts | Deduplicated by message ID, at most 22, including successful user and Assistant text |
+| Long messages | Above 2,000 characters, return a marked search snippet; ID expansion can still be truncated |
+
+The model may change keywords or pass `conversationId` and `messageId` to expand another result. There is no body-offset pagination for a truncated message. Assistants remove the tool after the budget is exhausted; Agents receive a stop-searching result. The next answer starts a new budget.
+
+Results carry roles, message/conversation IDs, message dates, match ranks where applicable, and truncation flags. Assistant text provides context; user messages supply factual evidence. Event dates come from the message content. If a search misses relevant context, the model can try alternative keywords within the call budget.
+
+## Organization (Dreaming)
+
+Organization reads the existing entry and topics in one scope, then reorganizes their facts and links.
+
+Automatic triggers are ten successful controlled content edits, seven days since the first pending change, or changed content reaching a capacity warning. A manual request also triggers a check. No-op, failed, metadata-only, Dreaming and recovery writes do not increase the edit count. External edits are detected by hash; their historical edit count is not reconstructed.
+
+A shared schedule wakes every minute while the app runs. Missed intervals are not replayed. Each scan considers the entry and up to nine topics, prioritizing eligible changed files and rotating through remaining work. A model batch contains at most ten complete files and 50,000 UTF-8 bytes, reduced to fit the selected model. A topic that cannot fit even with only the entry is marked blocked so smaller topics can proceed.
+
+Each batch makes one model call with tools disabled and no automatic call retry. Unchanged input has at most two attempts, ten minutes apart. New input, a manual request or a changed default model can provide another opportunity. Processed hashes and pending state live in module-owned `app_state`, independently of removable job history.
+
+Inference runs outside the write lock. Commit rechecks all input receipts, versions, authorization and cancellation. Topic deletion requires the complete active file set, distinct source/destination topics, verbatim source preservation and updated Markdown/wiki links. Transfers for deletion operate between topics, leaving `MEMORY.md` as the entry. Targets and links save before sources are removed. Partial outcomes remain recoverable.
+
+## Controlled writes, backups and recovery
+
+Pi's native `read`, `write` and `edit` route managed targets through `MemoryService`. A full read produces a caller-bound receipt. Saving binds that receipt to the exact approved proposal and checks for concurrent changes. A new file requires a confirmed missing-file baseline.
+
+Claude Code's native file hooks reject managed targets. The identity-free filesystem MCP and Pi's optional grep/find/ls also reject managed targets and related directory operations. Native managed-file access is currently provided through Pi's controlled `read`, `write` and `edit`.
+
+Before a controlled change, the store validates paths and versions, creates a backup, writes a complete temporary file and replaces the target. Backup failure prevents the change. Shell, scripts, external editors and other direct disk access are outside this protection.
+
+| Limit | Value |
+|---|---|
+| Entry save | 200 lines and 25,000 UTF-8 bytes |
+| Topic save | 25,000 UTF-8 bytes |
+| Capacity warning | Entry: 160 lines or 20,000 bytes; topic: 20,000 bytes |
+| Full-scope model-read/state check | 20 MiB |
+| Recovery storage per scope | At most five batches and 20 MiB, including manifest/encoding overhead |
+
+Oversized originals are retained, and replacement requires a complete read. The backup root is `{userData}/Data/MemoryBackups/`, outside active memory. Protected or partial recovery batches are retained. Writing stops when required backups exceed the available quota.
+
+Recovery applies only when current files still match the recorded operation result. Later edits or a new same-name file cause conflicts. Multi-file operations can partially succeed; report each result. File replacement and SQLite state are not one transaction, so interrupted work is reconciled from actual hashes instead of replayed.
+
+### Clear, forgotten state and runtime blocking
+
+Shared clear binds the exact file set and versions before confirmation. It leaves private, legacy and unknown files alone. The dialog hides filenames; recovery retains a file preview. Backups remain after clear.
+
+Clearing nonempty content persists empty `forgotten` markers rather than merely deleting all memory state. The store also understands structured `active`, `expired` and `forgotten` entries. Model views exclude forgotten content, matching source-message copies and known derivatives. Current views exclude expired entries; historical views can retain their status and dates. Source-version changes do not lift suppression.
+
+The runtime blocks memory-associated requests when a scope contains expired, forgotten or invalid state, including requests in new persistent conversations. These markers persist across restarts and shared-access changes. Temporary requests without memory remain separate.
+
+Structured scopes pause automatic append and ordinary organization because these operations require whole-file overwrite receipts. Recovery preserves forgotten markers and returns a conflict when restoring protected plaintext would violate them.
+
+## Legacy FACT and JOURNAL
+
+Private migration backs up FACT and preserves its content, conditions and references before enabling the Agent's private `MEMORY.md` and topics. Unsafe splitting, ambiguous links or partial results leave the original recoverable and the new private scope inactive. Read-only legacy FACT can remain in the prompt until migration succeeds.
+
+After migration, FACT and JOURNAL are retained history. Active memory changes use `MEMORY.md` and topics. The identity/legacy editor operates on its original files independently.
+
+## Choosing a mechanism
+
+- Personal context that eligible callers can share: shared file memory.
+- Project or customer knowledge owned by one Agent: private file memory.
+- A past detail not present in the entry snapshot: bounded conversation recall.
+- Documents you curate and search: [Knowledge Base](../knowledge/README.md).
+- Explicit entity/relation operations: the independent graph-memory MCP.
+
+See [the module contract](../../../../src/main/ai/memory/README.md) for implementation-specific failure and lifecycle rules. Service-level tests and historical model evaluations do not establish complete desktop, native-platform or packaged-build acceptance.

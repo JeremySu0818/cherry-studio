@@ -447,7 +447,7 @@
     },
     {
       "path": "docs/dev/references/memory/overview.md",
-      "sources": ["src/main/ai/agents/prompt.ts","src/main/ai/mcp/servers/memory.ts","src/main/ai/memory","src/main/features/knowledge"]
+      "sources": ["src/main/ai/agents/prompt.ts","src/main/ai/mcp/servers/cherryAutonomyTools.ts","src/main/ai/mcp/servers/memory.ts","src/main/ai/memory","src/main/ai/runtime/aiSdk/params/buildAgentParams.ts","src/main/ai/runtime/claudeCode","src/main/ai/runtime/pi","src/main/features/knowledge","src/main/ipc/handlers/agent.ts","src/main/ipc/handlers/memory.ts","src/renderer/components/memory","src/renderer/components/resourceCatalog/dialogs/edit","src/renderer/components/settingsMenu.ts","src/renderer/pages/settings/MemorySettings.tsx"]
     },
     {
       "path": "docs/dev/references/memory/README.md",
