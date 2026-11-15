@@ -954,7 +954,7 @@ describe('useAgentChatRuntimeState', () => {
           expect.objectContaining({
             key: original.key,
             type: 'error',
-            title: expect.stringContaining('compact startup failed')
+            cause: expect.objectContaining({ message: 'compact startup failed' })
           })
         ])
       }
@@ -964,7 +964,7 @@ describe('useAgentChatRuntimeState', () => {
         expect(await result.current.sendMessage({ text: '/compact' })).toBe(false)
       })
       expect(toast.getToastQueue().toasts).toEqual([
-        expect.objectContaining({ type: 'error', title: expect.stringContaining('manual compact failed') })
+        expect.objectContaining({ type: 'error', cause: expect.objectContaining({ message: 'manual compact failed' }) })
       ])
     }
   )
@@ -1070,7 +1070,7 @@ describe('useAgentChatRuntimeState', () => {
         expect(toast.getToastQueue().toasts).toEqual([
           expect.objectContaining({ key: original.key, type: outcome === 'error' ? 'error' : 'success' })
         ])
-        if (outcome === 'error') expect(toast.getToastQueue().toasts[0].title).toContain('compact execution failed')
+        if (outcome === 'error') expect(toast.getToastQueue().toasts[0].cause).toEqual(error)
       }
       unmount()
       expect([...mocks.streamListeners.values()].every((listeners) => listeners.size === 0)).toBe(true)
