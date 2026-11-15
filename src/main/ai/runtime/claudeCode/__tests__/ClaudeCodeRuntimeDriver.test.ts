@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Worker } from 'node:worker_threads'
@@ -22,6 +22,7 @@ import { ClaudeCodeRuntimeDriver } from '../ClaudeCodeRuntimeDriver'
 import { ClaudeCodeSessionStateService } from '../ClaudeCodeSessionStateService'
 import { ClaudeCodeWarmQueryManager } from '../ClaudeCodeWarmQueryManager'
 import { forkClaudeSession } from '../claudeFork'
+import { createClaudeCodeIdentityHooks } from '../identityHooks'
 import * as processDiagnostics from '../processExitDiagnostics'
 
 const memoryRuntimeMocks = vi.hoisted(() => ({ build: vi.fn(), startup: vi.fn(), runtime: vi.fn() }))
@@ -736,6 +737,61 @@ describe('Claude warm memory handoff', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     MockApplicationUtils.resetServices()
+  })
+
+  it('refreshes identity in an authorized session and blocks it after shared memory is cleared', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'claude-memory-identity-'))
+    vi.spyOn(application, 'getPath').mockImplementation((key, name) => path.join(root, key, name ?? ''))
+    dbh.db
+      .insert(agentTable)
+      .values({ id: 'agent', type: 'claude-code', name: 'A', instructions: '', orderKey: 'a0' })
+      .run()
+    dbh.db.insert(agentWorkspaceTable).values({ id: 'workspace', name: 'W', path: root, orderKey: 'a0' }).run()
+    dbh.db
+      .insert(agentSessionTable)
+      .values({ id: 'session', agentId: 'agent', workspaceId: 'workspace', name: 'S', orderKey: 'a0' })
+      .run()
+    const agentDataPath = application.getPath('feature.agents.data', 'agent')
+    await mkdir(agentDataPath, { recursive: true })
+    const memory = new MemoryService()
+    MockApplicationUtils.setService('MemoryService', memory)
+    MockApplicationUtils.setService('AgentSessionRuntimeService', {
+      getInteractionState: () => ({ currentTurn: 'interactive', userResponse: 'stream' })
+    })
+    const editor = memory.open({ scope: { kind: 'shared' }, assertAuthorized: () => undefined })
+    try {
+      await editor.entry()
+      await writeFile(application.getPath('feature.memory.data', 'MEMORY.md'), 'Shared context')
+      const soul = path.join(agentDataPath, 'SOUL.md')
+      await writeFile(soul, 'Persona A')
+      const hooks = createClaudeCodeIdentityHooks(agentDataPath, 'session')
+      const submit = () =>
+        hooks.UserPromptSubmit![0].hooks[0]({ hook_event_name: 'UserPromptSubmit' } as never, undefined, {
+          signal: new AbortController().signal
+        })
+      expect(await submit()).toMatchObject({
+        hookSpecificOutput: { additionalContext: expect.stringContaining('Persona A') }
+      })
+      await writeFile(soul, 'Persona B refreshed')
+      const changed = new Date(Date.now() + 1000)
+      await utimes(soul, changed, changed)
+      const refreshed = await submit()
+      expect(refreshed).toMatchObject({
+        hookSpecificOutput: { additionalContext: expect.stringContaining('Persona B refreshed') }
+      })
+      const context = 'hookSpecificOutput' in refreshed && refreshed.hookSpecificOutput
+      expect(context && 'additionalContext' in context && context.additionalContext).toContain('Shared context')
+      expect(context && 'additionalContext' in context && context.additionalContext).not.toContain('Persona A')
+      expect(await submit()).toEqual({})
+
+      const preview = await editor.previewClear()
+      await editor.clear(preview.token, async () => () => undefined)
+      expect(await submit()).toMatchObject({ continue: false })
+    } finally {
+      editor.dispose()
+      await memory['_doStop']()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it.each(['open', 'handoff', 'none'] as const)('guards the runtime receiver when invalidated at %s', async (phase) => {
